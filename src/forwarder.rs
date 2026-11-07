@@ -2,11 +2,11 @@
 
 use crate::error::CollectorError;
 use crate::wal::EdgeRingWal;
-use mu_isolation::{
+use mu_ci_isolation::{
     EffectiveSandboxPolicy, IsolationBackend, KernelSandbox, LandlockRuleBuilder,
     NetworkEgressMode, SandboxBackendKind, SandboxExecutionPlan,
 };
-use muobserve_ipc::{
+use mu_observable_ipc::{
     create_fory_registry, decode_control_envelope, read_frame, write_frame, ControlRpcEnvelope,
     IpcHeader, WalBatchAck, MSG_TYPE_FORY_CONTROL, MSG_TYPE_WAL_ACK,
 };
@@ -101,7 +101,7 @@ pub fn apply_collector_startup_sandbox(
 ) -> Result<SandboxExecutionPlan, CollectorError> {
     let policy = build_collector_sandbox_policy(cfg);
     let sandbox = KernelSandbox::new();
-    let argv = vec![OsString::from("/usr/local/bin/muobserve-collector")];
+    let argv = vec![OsString::from("/usr/local/bin/mu-observable-collector")];
     let plan = sandbox.build_execution_plan(&policy, &argv)?;
 
     if cfg.enforce_landlock_on_linux {
@@ -389,8 +389,8 @@ pub fn decode_wal_ack_frame(
 mod tests {
     use super::*;
     use crate::wal::WalSignalPriority;
-    use mu_isolation::{EXEC_ACCESS, READ_ACCESS, WRITE_ACCESS};
-    use muobserve_ipc::{
+    use mu_ci_isolation::{EXEC_ACCESS, READ_ACCESS, WRITE_ACCESS};
+    use mu_observable_ipc::{
         decode_log_batch, encode_log_batch, OtelLogEntry, FLAG_HIGH_PRIORITY,
         MSG_TYPE_ARROW_OTEL_LOGS,
     };

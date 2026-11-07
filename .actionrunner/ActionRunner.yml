@@ -1,5 +1,6 @@
 version: "3"
-name: "MuObserve-collector 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
+name: "mu-observable-collector 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
+sccache: try
 
 env:
   CARGO_TERM_COLOR: "always"

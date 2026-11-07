@@ -1,10 +1,10 @@
-name = "muobserve-collector"
-# Crate-embedded Symposium manifest for muobserve-collector.
+name = "mu-observable-collector"
+# Crate-embedded Symposium manifest for mu-observable-collector.
 
 [[plugins]]
-depends-on = ["muobserve-ipc"]
-source.cargo = "muobserve-ipc"
+depends-on = ["mu-observable-ipc"]
+source.cargo = "mu-observable-ipc"
 
 [[plugins]]
-depends-on = ["mu-isolation"]
-source.cargo = "mu-isolation"
+depends-on = ["mu-ci-isolation"]
+source.cargo = "mu-ci-isolation"

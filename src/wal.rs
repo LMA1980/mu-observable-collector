@@ -1,7 +1,7 @@
 //! Bounded `256 MiB` Edge Ring-Buffer Write-Ahead Log (`EdgeRingWal`) with priority backpressure eviction (`M3.029`).
 
 use crate::error::CollectorError;
-use muobserve_ipc::{
+use mu_observable_ipc::{
     FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_BENCH_RUNS, MSG_TYPE_ARROW_OTEL_LOGS,
     MSG_TYPE_ARROW_OTEL_METRICS, MSG_TYPE_ARROW_OTEL_SPANS, MSG_TYPE_ARROW_TEST_RUNS,
 };

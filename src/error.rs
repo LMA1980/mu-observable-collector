@@ -1,8 +1,8 @@
-//! Error types for `muobserve-collector`.
+//! Error types for `mu-observable-collector`.
 
 use thiserror::Error;
 
-/// Unified error type for `MuObserve-collector` ingestion, scrubbing, WAL storage,
+/// Unified error type for `mu-observable-collector` ingestion, scrubbing, WAL storage,
 /// `MuIsolation` sandboxing, and `step-ca` mTLS forwarding.
 #[derive(Debug, Error)]
 pub enum CollectorError {
@@ -10,10 +10,10 @@ pub enum CollectorError {
     Io(#[from] std::io::Error),
 
     #[error("IPC wire/schema error: {0}")]
-    Ipc(#[from] muobserve_ipc::IpcError),
+    Ipc(#[from] mu_observable_ipc::IpcError),
 
     #[error("Sandbox isolation error: {0}")]
-    Isolation(#[from] mu_isolation::IsolationError),
+    Isolation(#[from] mu_ci_isolation::IsolationError),
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),

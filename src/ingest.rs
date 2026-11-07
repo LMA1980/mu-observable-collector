@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use muobserve_ipc::{
+use mu_observable_ipc::{
     create_fory_registry, encode_log_batch, encode_metric_batch, encode_span_batch, read_frame,
     write_frame, IpcHeader, OtelLogEntry, OtelMetricEntry, OtelSpanEntry, WalBatchAck,
     FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_ARROW_OTEL_METRICS,
@@ -132,7 +132,7 @@ async fn handle_otlp_traces(
 ) -> Result<(StatusCode, Json<OtlpIngestResponse>), (StatusCode, String)> {
     let is_arrow = is_arrow_content_type(&headers);
     let mut spans = if is_arrow {
-        muobserve_ipc::decode_span_batch(&body).map_err(|e| {
+        mu_observable_ipc::decode_span_batch(&body).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Arrow span batch: {e}"),
@@ -186,7 +186,7 @@ async fn handle_otlp_metrics(
 ) -> Result<(StatusCode, Json<OtlpIngestResponse>), (StatusCode, String)> {
     let is_arrow = is_arrow_content_type(&headers);
     let mut metrics = if is_arrow {
-        muobserve_ipc::decode_metric_batch(&body).map_err(|e| {
+        mu_observable_ipc::decode_metric_batch(&body).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Arrow metric batch: {e}"),
@@ -240,7 +240,7 @@ async fn handle_otlp_logs(
 ) -> Result<(StatusCode, Json<OtlpIngestResponse>), (StatusCode, String)> {
     let is_arrow = is_arrow_content_type(&headers);
     let mut logs = if is_arrow {
-        muobserve_ipc::decode_log_batch(&body).map_err(|e| {
+        mu_observable_ipc::decode_log_batch(&body).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Arrow log batch: {e}"),
@@ -726,7 +726,7 @@ where
     loop {
         let (header, payload) = match read_frame(&mut stream).await {
             Ok(pair) => pair,
-            Err(muobserve_ipc::IpcError::Io(ref e))
+            Err(mu_observable_ipc::IpcError::Io(ref e))
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::UnexpectedEof
@@ -767,7 +767,7 @@ where
 
         let ack_bytes = fory
             .serialize(&ack)
-            .map_err(muobserve_ipc::IpcError::Fory)?;
+            .map_err(mu_observable_ipc::IpcError::Fory)?;
         let ack_len = u32::try_from(ack_bytes.len()).unwrap_or(u32::MAX);
         let ack_hdr = IpcHeader::new(MSG_TYPE_WAL_ACK, ack_len, 0, header.sequence);
         write_frame(&mut stream, &ack_hdr, &ack_bytes).await?;
@@ -837,7 +837,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use muobserve_ipc::{
+    use mu_observable_ipc::{
         decode_log_batch, decode_metric_batch, decode_span_batch, decode_test_run_batch,
         encode_test_run_batch, TestCaseRunEntry, MSG_TYPE_ARROW_TEST_RUNS, REDACTED_PLACEHOLDER,
     };

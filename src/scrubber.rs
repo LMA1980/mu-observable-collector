@@ -1,7 +1,7 @@
 //! Streaming edge secret redaction prior to Edge WAL persistence (`M3.026`).
 
 use crate::error::CollectorError;
-use muobserve_ipc::{
+use mu_observable_ipc::{
     decode_benchmark_run_batch, decode_log_batch, decode_metric_batch, decode_span_batch,
     decode_test_run_batch, encode_benchmark_run_batch, encode_log_batch, encode_metric_batch,
     encode_span_batch, encode_test_run_batch, BenchmarkRunEntry, DeterministicSecretRedactor,

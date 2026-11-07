@@ -1,18 +1,18 @@
-//! `muobserve-collector`: Sandboxed node-level edge telemetry collector daemon (`M3.022`–`M3.030`).
+//! `mu-observable-collector`: Sandboxed node-level edge telemetry collector daemon (`M3.022`–`M3.030`).
 //!
 //! Provides:
 //! - Dual local ingestion (`src/ingest.rs`): loopback OTLP HTTP (`/v1/traces`, `/v1/metrics`, `/v1/logs`, `/healthz`)
 //!   and native `MUOB`-framed Apache Arrow IPC streams (`MSG_TYPE_ARROW_OTEL_LOGS`, `MSG_TYPE_ARROW_OTEL_SPANS`,
 //!   `MSG_TYPE_ARROW_OTEL_METRICS`, `MSG_TYPE_ARROW_TEST_RUNS`, `MSG_TYPE_ARROW_BENCH_RUNS`).
 //! - Streaming edge secret redaction (`src/scrubber.rs`): [`EdgeSecretScrubber`] implementing
-//!   [`muobserve_ipc::SecretRedactor`] to scrub Bearer tokens, GitHub PATs (`ghp_`/`github_pat_`),
+//!   [`mu_observable_ipc::SecretRedactor`] to scrub Bearer tokens, GitHub PATs (`ghp_`/`github_pat_`),
 //!   webhook secrets, PEM private keys, and registered secret environment values prior to WAL persistence.
 //! - Bounded `256 MiB` Edge Ring-Buffer WAL (`src/wal.rs`): [`EdgeRingWal`] enforcing `max_wal_bytes`
 //!   (`256 MiB` default) and `max_age_secs` (`86400s`), evicting acknowledged and expired batches first
 //!   and dropping low-priority debug logs before error logs, spans, metrics, test runs, or benchmarks.
 //! - `step-ca` mTLS upstream batch forwarder & `MuIsolation` startup confinement (`src/forwarder.rs`):
 //!   [`MtlsForwarder`] streaming unacknowledged WAL batches over `tokio-rustls` with exponential backoff
-//!   and truncating upon [`WalBatchAck`], confined by [`mu_isolation::KernelSandbox`].
+//!   and truncating upon [`WalBatchAck`], confined by [`mu_ci_isolation::KernelSandbox`].
 
 #![deny(unsafe_code)]
 
@@ -41,8 +41,8 @@ pub use wal::{
     DEFAULT_MAX_AGE_SECS, DEFAULT_MAX_WAL_BYTES, DEFAULT_WAL_PATH,
 };
 
-// Re-exports & compatibility aliases for `muobserve-ipc` wire types
-pub use muobserve_ipc::{
+// Re-exports & compatibility aliases for `mu-observable-ipc` wire types
+pub use mu_observable_ipc::{
     BenchmarkRunEntry, DeterministicSecretRedactor,
     DeterministicSecretRedactor as RegexSecretRedactor, IpcHeader, OtelLogEntry, OtelMetricEntry,
     OtelSpanEntry, SecretRedactor, TestCaseRunEntry, TraceContext, TraceContext as W3cTraceContext,
