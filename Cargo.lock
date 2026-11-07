@@ -926,9 +926,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "mu-isolation"
+name = "mu-ci-isolation"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/MuIsolation.git?branch=main#7fe24485def682cdcb7f65882c99d6c72a82b233"
+source = "git+https://github.com/LMA1980/mu-ci-isolation.git?branch=feat%2Fm8-naming-alignment#98117ee3d6270c6ca9f290c2881515db65d7147b"
 dependencies = [
  "landlock",
  "libc",
@@ -941,7 +941,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "muobserve-collector"
+name = "mu-observable-collector"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -950,8 +950,8 @@ dependencies = [
  "fory",
  "http",
  "http-body-util",
- "mu-isolation",
- "muobserve-ipc",
+ "mu-ci-isolation",
+ "mu-observable-ipc",
  "rcgen",
  "rustls",
  "rustls-pki-types",
@@ -967,9 +967,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "muobserve-ipc"
+name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/MuObserve-ipc.git?branch=main#72476e02a6dc873a7a9122a7f4f55cf91ac88836"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=feat%2Fm8-naming-alignment#28793ce66732461cb68c3aef3006154939265abb"
 dependencies = [
  "arrow",
  "bytes",

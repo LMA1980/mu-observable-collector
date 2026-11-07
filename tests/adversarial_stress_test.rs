@@ -8,12 +8,12 @@
 //! 4. Concurrent HTTP (:4318) and TCP (:4319) traffic without listener starvation.
 //! 5. Shutdown signal handling under in-flight TCP/HTTP connection load.
 
-use muobserve_collector::{
+use mu_observable_collector::{
     build_otlp_router, serve_muob_tcp_listener, CollectorBatchAck, CollectorIngestState,
     EdgeRingWal, EdgeSecretScrubber, IpcHeader, OtelLogEntry, OtelSpanEntry, TestCaseRunEntry,
     FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_SPANS, MSG_TYPE_ARROW_TEST_RUNS, MSG_TYPE_WAL_ACK,
 };
-use muobserve_ipc::{
+use mu_observable_ipc::{
     create_fory_registry, encode_span_batch, encode_test_run_batch, read_frame, write_frame,
     MAX_FRAME_SIZE,
 };
@@ -71,10 +71,10 @@ fn make_span_batch(seq: u64, secret_token: &str) -> (Vec<u8>, IpcHeader) {
 fn make_test_run_batch(seq: u64, secret_token: &str) -> (Vec<u8>, IpcHeader) {
     let runs = vec![TestCaseRunEntry {
         job_id: format!("job_{seq}"),
-        repo_key: "lma1980/muobserve".to_string(),
+        repo_key: "lma1980/mu-observable".to_string(),
         branch_key: "main".to_string(),
         commit_sha: "abcd1234ef567890".to_string(),
-        crate_name: "muobserve-collector".to_string(),
+        crate_name: "mu-observable-collector".to_string(),
         test_binary: "adversarial_stress".to_string(),
         test_name: format!("stress_test_{seq}"),
         status: "passed".to_string(),
@@ -519,9 +519,9 @@ fn make_debug_log_batch(seq: u64) -> (Vec<u8>, IpcHeader) {
         job_id: None,
         stage_id: None,
     }];
-    let bytes = muobserve_ipc::encode_log_batch(&logs).expect("encode log batch");
+    let bytes = mu_observable_ipc::encode_log_batch(&logs).expect("encode log batch");
     let hdr = IpcHeader::new(
-        muobserve_collector::MSG_TYPE_ARROW_LOGS,
+        mu_observable_collector::MSG_TYPE_ARROW_LOGS,
         u32::try_from(bytes.len()).unwrap(),
         0, // Not FLAG_HIGH_PRIORITY
         seq,
@@ -602,7 +602,7 @@ async fn test_stress_wal_backpressure_and_ack_under_memory_exhaustion() {
 
 #[test]
 fn test_ingest_config_environment_variable_resolution() {
-    use muobserve_collector::IngestConfig;
+    use mu_observable_collector::IngestConfig;
 
     // Test default configuration
     let default_cfg = IngestConfig::default();

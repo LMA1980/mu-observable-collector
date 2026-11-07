@@ -1,4 +1,4 @@
-use muobserve_collector::{
+use mu_observable_collector::{
     apply_collector_startup_sandbox, build_otlp_router, serve_muob_tcp_listener,
     CollectorIngestState, CollectorSandboxConfig, EdgeRingWal, EdgeSecretScrubber, IngestConfig,
     MtlsForwarder, MtlsForwarderConfig, DEFAULT_MAX_AGE_SECS, DEFAULT_MAX_WAL_BYTES,
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         arch = %arch,
         landlock_rules = plan.landlock_rules.len(),
         wal_ceiling_mib = DEFAULT_WAL_MAX_MB,
-        "muobserve-collector v{} initialized under MuIsolation KernelSandbox",
+        "mu-observable-collector v{} initialized under MuIsolation KernelSandbox",
         env!("CARGO_PKG_VERSION")
     );
 

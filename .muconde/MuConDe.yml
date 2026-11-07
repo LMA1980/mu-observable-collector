@@ -1,5 +1,5 @@
 version: "1"
-service: "muobserve-collector.service"
+service: "mu-observable-collector.service"
 target_nodes:
   - "node-a"
   - "node-b"

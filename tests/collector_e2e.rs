@@ -1,8 +1,8 @@
-//! End-to-end integration tests for `muobserve-collector` (`M3.022`–`M3.030`).
+//! End-to-end integration tests for `mu-observable-collector` (`M3.022`–`M3.030`).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use muobserve_collector::{
+use mu_observable_collector::{
     apply_collector_startup_sandbox, build_otlp_router, build_tls_server_config,
     handle_muob_connection, BenchmarkRunEntry, CollectorBatchAck, CollectorIngestState,
     CollectorSandboxConfig, EdgeRingWal, EdgeSecretScrubber, IpcHeader, MtlsForwarder,
@@ -11,7 +11,7 @@ use muobserve_collector::{
     MSG_TYPE_ARROW_METRICS, MSG_TYPE_ARROW_SPANS, MSG_TYPE_ARROW_TEST_RUNS, MSG_TYPE_WAL_ACK,
     REDACTED_PLACEHOLDER,
 };
-use muobserve_ipc::{
+use mu_observable_ipc::{
     create_fory_registry, decode_benchmark_run_batch, decode_log_batch, decode_metric_batch,
     decode_span_batch, decode_test_run_batch, encode_benchmark_run_batch, encode_log_batch,
     encode_metric_batch, encode_span_batch, encode_test_run_batch, read_frame, write_frame,
@@ -389,7 +389,7 @@ async fn test_serve_mode_concurrent_listeners_and_muob_tcp_ingestion() {
     let muob_addr = muob_listener.local_addr().unwrap();
 
     // Verify IngestConfig default constant values match specifications
-    let default_cfg = muobserve_collector::IngestConfig::default();
+    let default_cfg = mu_observable_collector::IngestConfig::default();
     assert_eq!(default_cfg.otlp_http_addr, "127.0.0.1:4318");
     assert_eq!(default_cfg.muob_tcp_addr, "127.0.0.1:4319");
 
@@ -402,7 +402,7 @@ async fn test_serve_mode_concurrent_listeners_and_muob_tcp_ingestion() {
 
     let state_muob = state.clone();
     let muob_task = tokio::spawn(async move {
-        muobserve_collector::serve_muob_tcp_listener(muob_listener, state_muob).await
+        mu_observable_collector::serve_muob_tcp_listener(muob_listener, state_muob).await
     });
 
     // 4. Send OTLP HTTP log to HTTP listener
