@@ -950,6 +950,7 @@ dependencies = [
  "fory",
  "http",
  "http-body-util",
+ "libc",
  "mu-ci-isolation",
  "mu-observable-ipc",
  "rcgen",

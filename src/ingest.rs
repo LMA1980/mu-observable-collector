@@ -18,8 +18,9 @@ use mu_observable_ipc::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -29,6 +30,12 @@ pub const DEFAULT_OTLP_HTTP_ADDR: &str = "127.0.0.1:4318";
 
 /// Default loopback native Arrow IPC TCP address (`127.0.0.1:4319`).
 pub const DEFAULT_MUOB_TCP_ADDR: &str = "127.0.0.1:4319";
+
+/// Default bounded FIFO line deduplication ring capacity (`16_384` log lines).
+pub const DEFAULT_LOG_DEDUP_CAPACITY: usize = 16_384;
+
+const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_64_PRIME: u64 = 0x0100_0000_01b3;
 
 /// Configuration for the node-local OTLP HTTP and native `MUOB` Arrow IPC ingestion listeners.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +75,78 @@ impl IngestConfig {
     }
 }
 
+/// Bounded FIFO ring buffer (`VecDeque<u64>` + `HashSet<u64>`) tracking recently ingested
+/// single-line log deduplication hashes.
+#[derive(Debug)]
+pub struct LineDeduplicator {
+    capacity: usize,
+    ring: VecDeque<u64>,
+    seen: HashSet<u64>,
+    dropped_duplicates: u64,
+}
+
+impl LineDeduplicator {
+    /// Creates a new [`LineDeduplicator`] with the specified ring capacity.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            ring: VecDeque::with_capacity(capacity.min(1024)),
+            seen: HashSet::with_capacity(capacity.min(1024)),
+            dropped_duplicates: 0,
+        }
+    }
+
+    /// Returns `true` if `dedup_hash` was not present in the FIFO window (and inserts it),
+    /// or `false` if it is a duplicate within the current window.
+    pub fn insert_if_novel(&mut self, dedup_hash: u64) -> bool {
+        if self.capacity == 0 {
+            return true;
+        }
+        if self.seen.contains(&dedup_hash) {
+            self.dropped_duplicates += 1;
+            return false;
+        }
+        while self.ring.len() >= self.capacity {
+            if let Some(evicted) = self.ring.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.ring.push_back(dedup_hash);
+        self.seen.insert(dedup_hash);
+        true
+    }
+
+    /// Total number of duplicate log lines dropped by this deduplicator.
+    #[must_use]
+    pub const fn dropped_duplicates(&self) -> u64 {
+        self.dropped_duplicates
+    }
+
+    /// Current number of hashes stored in the deduplication window.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Returns `true` if the deduplication window is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+}
+
+/// Alias for [`CollectorIngestState`].
+pub type IngestState = CollectorIngestState;
+
+/// Outcome of ingesting a single framed Arrow IPC batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestBatchOutcome {
+    pub wal_sequence: Option<u64>,
+    pub accepted_rows: u32,
+    pub deduplicated_empty: bool,
+}
+
 /// Shared state for the node-local `MuObserve-collector` ingestion endpoints.
 #[derive(Clone)]
 pub struct CollectorIngestState {
@@ -75,6 +154,7 @@ pub struct CollectorIngestState {
     pub scrubber: Arc<EdgeSecretScrubber>,
     pub default_node_id: String,
     pub default_arch: String,
+    pub dedup: Arc<StdMutex<LineDeduplicator>>,
 }
 
 impl CollectorIngestState {
@@ -91,8 +171,247 @@ impl CollectorIngestState {
             scrubber,
             default_node_id: default_node_id.into(),
             default_arch: default_arch.into(),
+            dedup: Arc::new(StdMutex::new(LineDeduplicator::new(
+                DEFAULT_LOG_DEDUP_CAPACITY,
+            ))),
         }
     }
+
+    /// Overrides the bounded FIFO line deduplication ring capacity.
+    #[must_use]
+    pub fn with_dedup_capacity(mut self, capacity: usize) -> Self {
+        self.dedup = Arc::new(StdMutex::new(LineDeduplicator::new(capacity)));
+        self
+    }
+
+    /// Returns the total count of duplicate log lines dropped before hitting [`EdgeRingWal`].
+    #[must_use]
+    pub fn dropped_duplicate_logs(&self) -> u64 {
+        self.dedup
+            .lock()
+            .map(|d| d.dropped_duplicates())
+            .unwrap_or(0)
+    }
+
+    /// Splits multi-line [`OtelLogEntry`] records into 1-line records and drops duplicate lines
+    /// within the bounded FIFO deduplication window.
+    #[must_use]
+    pub fn normalize_and_dedup_logs(&self, entries: Vec<OtelLogEntry>) -> Vec<OtelLogEntry> {
+        let normalized = normalize_single_line_logs(entries);
+        let Ok(mut dedup) = self.dedup.lock() else {
+            return normalized;
+        };
+        let mut retained = Vec::with_capacity(normalized.len());
+        for entry in normalized {
+            let hash = compute_log_dedup_hash(&entry);
+            if dedup.insert_if_novel(hash) {
+                retained.push(entry);
+            }
+        }
+        retained
+    }
+
+    /// Ingests an Arrow IPC batch (`msg_type`, `flags`, `payload`), performing single-line log
+    /// normalization and FIFO line deduplication for `MSG_TYPE_ARROW_OTEL_LOGS`, scrubbing secrets,
+    /// and appending to [`EdgeRingWal`].
+    ///
+    /// If all lines in a `MSG_TYPE_ARROW_OTEL_LOGS` batch are duplicates, returns `Ok(())` without
+    /// writing an empty batch to [`EdgeRingWal`].
+    pub async fn ingest_arrow_batch(
+        &self,
+        msg_type: u16,
+        flags: u32,
+        payload: &[u8],
+    ) -> Result<(), CollectorError> {
+        let _ = self.ingest_arrow_frame(msg_type, flags, payload).await?;
+        Ok(())
+    }
+
+    /// Internal frame ingestion helper returning [`IngestBatchOutcome`] for wire ACK construction.
+    pub async fn ingest_arrow_frame(
+        &self,
+        msg_type: u16,
+        flags: u32,
+        payload: &[u8],
+    ) -> Result<IngestBatchOutcome, CollectorError> {
+        if msg_type == MSG_TYPE_ARROW_OTEL_LOGS {
+            let raw_logs = mu_observable_ipc::decode_log_batch(payload)?;
+            let mut logs = self.normalize_and_dedup_logs(raw_logs);
+            if logs.is_empty() {
+                return Ok(IngestBatchOutcome {
+                    wal_sequence: None,
+                    accepted_rows: 0,
+                    deduplicated_empty: true,
+                });
+            }
+            self.scrubber.scrub_log_batch(&mut logs);
+            let high_priority = logs.iter().any(is_high_priority_log);
+            let priority = WalSignalPriority::classify(msg_type, flags, high_priority);
+            let accepted_rows = u32::try_from(logs.len()).unwrap_or(u32::MAX);
+            let encoded = encode_log_batch(&logs)?;
+
+            let mut wal = self.wal.lock().await;
+            let wal_sequence = wal.append(msg_type, flags, priority, encoded)?;
+            return Ok(IngestBatchOutcome {
+                wal_sequence,
+                accepted_rows: if wal_sequence.is_some() {
+                    accepted_rows
+                } else {
+                    0
+                },
+                deduplicated_empty: false,
+            });
+        }
+
+        let scrubbed = self.scrubber.scrub_arrow_frame_payload(msg_type, payload)?;
+        let priority = WalSignalPriority::classify(msg_type, flags, scrubbed.high_priority);
+        let wal_sequence = {
+            let mut wal = self.wal.lock().await;
+            wal.append(msg_type, flags, priority, scrubbed.payload)?
+        };
+        Ok(IngestBatchOutcome {
+            wal_sequence,
+            accepted_rows: if wal_sequence.is_some() {
+                scrubbed.row_count
+            } else {
+                0
+            },
+            deduplicated_empty: false,
+        })
+    }
+}
+
+/// Splits any [`OtelLogEntry`] whose `body` contains multiple lines (`\n`) into individual 1-line
+/// [`OtelLogEntry`] records, updating or injecting `"line_no"` and `"stream"` in `attributes_json`.
+#[must_use]
+pub fn normalize_single_line_logs(entries: Vec<OtelLogEntry>) -> Vec<OtelLogEntry> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !entry.body.contains('\n') {
+            let clean_body = entry.body.trim_end_matches('\r').to_string();
+            out.push(OtelLogEntry {
+                body: clean_body,
+                ..entry
+            });
+            continue;
+        }
+
+        let raw_lines: Vec<&str> = entry
+            .body
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .collect();
+        if raw_lines.is_empty() {
+            out.push(OtelLogEntry {
+                body: String::new(),
+                ..entry
+            });
+            continue;
+        }
+        if raw_lines.len() == 1 {
+            out.push(OtelLogEntry {
+                body: raw_lines[0].to_string(),
+                ..entry
+            });
+            continue;
+        }
+
+        let base_map: Map<String, Value> = serde_json::from_str::<Value>(&entry.attributes_json)
+            .ok()
+            .and_then(|v| match v {
+                Value::Object(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let base_line_no = base_map
+            .get("line_no")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok()))
+            .unwrap_or(1);
+
+        let stream = base_map
+            .get("stream")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("stdout")
+            .to_string();
+
+        for (idx, line_text) in raw_lines.into_iter().enumerate() {
+            let mut line_map = base_map.clone();
+            let line_no = base_line_no + (idx as u64);
+            line_map.insert("line_no".to_string(), Value::from(line_no));
+            line_map.insert("stream".to_string(), Value::String(stream.clone()));
+            let attributes_json =
+                serde_json::to_string(&line_map).unwrap_or_else(|_| "{}".to_string());
+
+            out.push(OtelLogEntry {
+                timestamp_unix_nano: entry.timestamp_unix_nano,
+                trace_id: entry.trace_id.clone(),
+                span_id: entry.span_id.clone(),
+                severity_number: entry.severity_number,
+                severity_text: entry.severity_text.clone(),
+                service_name: entry.service_name.clone(),
+                node_id: entry.node_id.clone(),
+                body: line_text.to_string(),
+                attributes_json,
+                job_id: entry.job_id.clone(),
+                stage_id: entry.stage_id.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV1A_64_PRIME);
+    }
+    hash ^= 0xff;
+    hash.wrapping_mul(FNV1A_64_PRIME)
+}
+
+/// Computes a deterministic 64-bit FNV-1a `dedup_hash` over
+/// `(node_id, service_name, job_id, stage_id, line_no, stream, timestamp_sec_bucket_or_zero_for_ci_line, body.trim_end())`.
+#[must_use]
+pub fn compute_log_dedup_hash(entry: &OtelLogEntry) -> u64 {
+    let parsed_attrs = serde_json::from_str::<Value>(&entry.attributes_json).ok();
+    let attrs_obj = parsed_attrs.as_ref().and_then(Value::as_object);
+
+    let job_id = entry
+        .job_id
+        .as_deref()
+        .or_else(|| attrs_obj.and_then(|m| m.get("job_id")?.as_str()))
+        .unwrap_or("");
+    let stage_id = entry
+        .stage_id
+        .as_deref()
+        .or_else(|| attrs_obj.and_then(|m| m.get("stage_id")?.as_str()))
+        .unwrap_or("");
+    let line_no = attrs_obj
+        .and_then(|m| m.get("line_no"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok()));
+    let stream = attrs_obj
+        .and_then(|m| m.get("stream"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let is_ci_line = !job_id.is_empty() || !stage_id.is_empty() || line_no.is_some();
+    let timestamp_sec_bucket_or_zero = if is_ci_line {
+        0u64
+    } else {
+        (entry.timestamp_unix_nano.max(0) as u64) / 1_000_000_000
+    };
+
+    let mut hash = FNV1A_64_OFFSET_BASIS;
+    hash = fnv1a_update(hash, entry.node_id.as_bytes());
+    hash = fnv1a_update(hash, entry.service_name.as_bytes());
+    hash = fnv1a_update(hash, job_id.as_bytes());
+    hash = fnv1a_update(hash, stage_id.as_bytes());
+    hash = fnv1a_update(hash, &line_no.unwrap_or(0).to_le_bytes());
+    hash = fnv1a_update(hash, stream.as_bytes());
+    hash = fnv1a_update(hash, &timestamp_sec_bucket_or_zero.to_le_bytes());
+    fnv1a_update(hash, entry.body.trim_end().as_bytes())
 }
 
 /// JSON response returned by `/v1/traces`, `/v1/metrics`, and `/v1/logs`.
@@ -239,7 +558,7 @@ async fn handle_otlp_logs(
     body: Bytes,
 ) -> Result<(StatusCode, Json<OtlpIngestResponse>), (StatusCode, String)> {
     let is_arrow = is_arrow_content_type(&headers);
-    let mut logs = if is_arrow {
+    let raw_logs = if is_arrow {
         mu_observable_ipc::decode_log_batch(&body).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -251,6 +570,7 @@ async fn handle_otlp_logs(
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
     };
 
+    let mut logs = state.normalize_and_dedup_logs(raw_logs);
     if logs.is_empty() {
         return Ok((
             StatusCode::OK,
@@ -739,26 +1059,16 @@ where
             Err(e) => return Err(CollectorError::Ipc(e)),
         };
 
-        let scrubbed = state
-            .scrubber
-            .scrub_arrow_frame_payload(header.msg_type, &payload)?;
-        let priority =
-            WalSignalPriority::classify(header.msg_type, header.flags, scrubbed.high_priority);
+        let outcome = state
+            .ingest_arrow_frame(header.msg_type, header.flags, &payload)
+            .await?;
 
-        let wal_seq = {
-            let mut wal = state.wal.lock().await;
-            wal.append(header.msg_type, header.flags, priority, scrubbed.payload)?
-        };
-
+        let ack_ok = outcome.wal_sequence.is_some() || outcome.deduplicated_empty;
         let ack = WalBatchAck {
-            sequence: wal_seq.unwrap_or(header.sequence),
-            accepted_rows: if wal_seq.is_some() {
-                scrubbed.row_count
-            } else {
-                0
-            },
-            ok: wal_seq.is_some(),
-            error_message: if wal_seq.is_some() {
+            sequence: outcome.wal_sequence.unwrap_or(header.sequence),
+            accepted_rows: outcome.accepted_rows,
+            ok: ack_ok,
+            error_message: if ack_ok {
                 None
             } else {
                 Some("Dropped low-priority batch due to WAL backpressure".to_string())
@@ -851,6 +1161,7 @@ mod tests {
         CollectorIngestState::new(wal, scrubber, "worker-riscv64", "riscv64gc")
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_otlp_http_traces_metrics_logs_and_healthz() {
         let state = test_state();
@@ -1003,6 +1314,7 @@ mod tests {
         assert!(logs[0].body.contains(REDACTED_PLACEHOLDER));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_muob_arrow_ipc_stream_listener_and_ack() {
         let state = test_state();
@@ -1057,5 +1369,126 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("ghp_superSecret987654321"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_single_line_normalization_and_fifo_line_deduplication() {
+        let state = test_state().with_dedup_capacity(4);
+
+        // 1. Ingest a multi-line OtelLogEntry (3 lines, with 1 duplicate line inside the same batch)
+        let multiline_entry = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_020_000_000_000,
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            service_name: "action-runner-worker".to_string(),
+            node_id: "worker-riscv64".to_string(),
+            body: "Compiling crate-a v0.1.0\nCompiling crate-b v0.1.0\nFinished dev profile\n"
+                .to_string(),
+            attributes_json: r#"{"stage":"build"}"#.to_string(),
+            job_id: Some("job-dedup-1".to_string()),
+            stage_id: Some("build".to_string()),
+        };
+
+        let raw_payload = encode_log_batch(std::slice::from_ref(&multiline_entry)).unwrap();
+        state
+            .ingest_arrow_batch(MSG_TYPE_ARROW_OTEL_LOGS, 0, &raw_payload)
+            .await
+            .expect("ingest multiline batch");
+
+        {
+            let wal = state.wal.lock().await;
+            let pending = wal.pending_batches();
+            assert_eq!(pending.len(), 1);
+            let logs = decode_log_batch(&pending[0].payload).unwrap();
+            assert_eq!(logs.len(), 3);
+            assert_eq!(logs[0].body, "Compiling crate-a v0.1.0");
+            assert_eq!(logs[1].body, "Compiling crate-b v0.1.0");
+            assert_eq!(logs[2].body, "Finished dev profile");
+
+            let attrs0: Value = serde_json::from_str(&logs[0].attributes_json).unwrap();
+            let attrs1: Value = serde_json::from_str(&logs[1].attributes_json).unwrap();
+            let attrs2: Value = serde_json::from_str(&logs[2].attributes_json).unwrap();
+            assert_eq!(attrs0.get("line_no").and_then(Value::as_u64), Some(1));
+            assert_eq!(attrs1.get("line_no").and_then(Value::as_u64), Some(2));
+            assert_eq!(attrs2.get("line_no").and_then(Value::as_u64), Some(3));
+            assert_eq!(attrs0.get("stream").and_then(Value::as_str), Some("stdout"));
+        }
+
+        // 2. Re-ingest the exact same multi-line batch (even with a newer timestamp for CI line):
+        // All 3 split lines are duplicates within the FIFO window -> must return Ok(()) without writing to WAL!
+        let mut retry_entry = multiline_entry.clone();
+        retry_entry.timestamp_unix_nano += 5_000_000_000;
+        let retry_payload = encode_log_batch(&[retry_entry]).unwrap();
+        state
+            .ingest_arrow_batch(MSG_TYPE_ARROW_OTEL_LOGS, 0, &retry_payload)
+            .await
+            .expect("ingest duplicate batch");
+
+        {
+            let wal = state.wal.lock().await;
+            assert_eq!(
+                wal.pending_batches().len(),
+                1,
+                "All-duplicate batch must not append an empty or duplicate entry to EdgeRingWal"
+            );
+            assert_eq!(state.dropped_duplicate_logs(), 3);
+        }
+
+        // 3. Push 2 new unique lines so the capacity-4 FIFO ring evicts the oldest hash (line 1)
+        let extra_entry = OtelLogEntry {
+            body: "Running test-1\nRunning test-2".to_string(),
+            attributes_json: r#"{"line_no":10,"stream":"stderr"}"#.to_string(),
+            ..multiline_entry.clone()
+        };
+        let extra_payload = encode_log_batch(&[extra_entry]).unwrap();
+        state
+            .ingest_arrow_batch(MSG_TYPE_ARROW_OTEL_LOGS, 0, &extra_payload)
+            .await
+            .unwrap();
+
+        {
+            let wal = state.wal.lock().await;
+            assert_eq!(wal.pending_batches().len(), 2);
+            let logs = decode_log_batch(&wal.pending_batches()[1].payload).unwrap();
+            assert_eq!(logs.len(), 2);
+            let attrs0: Value = serde_json::from_str(&logs[0].attributes_json).unwrap();
+            let attrs1: Value = serde_json::from_str(&logs[1].attributes_json).unwrap();
+            assert_eq!(attrs0.get("line_no").and_then(Value::as_u64), Some(10));
+            assert_eq!(attrs1.get("line_no").and_then(Value::as_u64), Some(11));
+            assert_eq!(attrs0.get("stream").and_then(Value::as_str), Some("stderr"));
+        }
+    }
+
+    #[test]
+    fn test_normalize_and_dedup_logs_sync() {
+        let state = test_state().with_dedup_capacity(3);
+        let entry = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_020_000_000_000,
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            service_name: "action-runner-worker".to_string(),
+            node_id: "worker-riscv64".to_string(),
+            body: "line alpha\nline beta\nline alpha".to_string(),
+            attributes_json: "{}".to_string(),
+            job_id: Some("job-1".to_string()),
+            stage_id: Some("test".to_string()),
+        };
+
+        let split = state.normalize_and_dedup_logs(vec![entry.clone()]);
+        // All 3 split lines have distinct line_no (1, 2, 3), so all 3 are retained on first pass
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[0].body, "line alpha");
+        assert_eq!(split[1].body, "line beta");
+        assert_eq!(split[2].body, "line alpha");
+
+        // Second pass of the identical entry: all 3 (line_no 1, 2, 3) are in the FIFO ring -> dropped!
+        let dup_pass = state.normalize_and_dedup_logs(vec![entry]);
+        assert!(dup_pass.is_empty());
+        assert_eq!(state.dropped_duplicate_logs(), 3);
     }
 }

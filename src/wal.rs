@@ -17,8 +17,68 @@ pub const DEFAULT_MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
 /// Default maximum retention age in seconds (`24 hours` = `86_400` seconds).
 pub const DEFAULT_MAX_AGE_SECS: u64 = 86_400;
 
+/// Default minimum free physical disk space in bytes (`512 MiB` = `536_870_912` bytes).
+pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Canonical production Edge WAL path on `MuObserve-collector` nodes.
 pub const DEFAULT_WAL_PATH: &str = "/var/lib/muobserve-collector/wal.duckdb";
+
+/// Resolves the minimum free physical disk space threshold in bytes from
+/// `MUOBSERVE_MIN_FREE_DISK_BYTES`, falling back to [`DEFAULT_MIN_FREE_DISK_BYTES`] (`512 MiB`).
+#[must_use]
+pub fn default_min_free_disk_bytes_from_env() -> u64 {
+    std::env::var("MUOBSERVE_MIN_FREE_DISK_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_DISK_BYTES)
+}
+
+/// Queries available unprivileged physical disk space in bytes via `libc::statvfs`
+/// on `path` (or its parent directory when `path` is a file path).
+#[cfg(all(unix, not(miri)))]
+#[allow(unsafe_code)]
+#[must_use]
+pub fn available_disk_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
+    let probe_path = if target.exists() {
+        target
+    } else {
+        Path::new(".")
+    };
+
+    let c_path = CString::new(probe_path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `libc::statvfs` populates the zero-initialized `statvfs` struct for a valid NUL-terminated path.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let frsize = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+    #[allow(clippy::unnecessary_cast)]
+    let bavail = stat.f_bavail as u64;
+    Some(bavail.saturating_mul(frsize))
+}
+
+/// Synthetic fallback for non-Unix targets or Miri isolation.
+#[cfg(any(not(unix), miri))]
+#[must_use]
+pub fn available_disk_bytes(_path: &Path) -> Option<u64> {
+    Some(64 * 1024 * 1024 * 1024)
+}
 
 /// Priority class governing backpressure eviction order when `EdgeRingWal` reaches `max_wal_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,6 +132,7 @@ pub struct EdgeRingWalConfig {
     pub storage_path: Option<PathBuf>,
     pub max_wal_bytes: usize,
     pub max_age_secs: u64,
+    pub min_free_disk_bytes: u64,
 }
 
 impl Default for EdgeRingWalConfig {
@@ -80,7 +141,17 @@ impl Default for EdgeRingWalConfig {
             storage_path: None,
             max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
             max_age_secs: DEFAULT_MAX_AGE_SECS,
+            min_free_disk_bytes: default_min_free_disk_bytes_from_env(),
         }
+    }
+}
+
+impl EdgeRingWalConfig {
+    /// Sets `min_free_disk_bytes` on this [`EdgeRingWalConfig`].
+    #[must_use]
+    pub const fn with_min_free_disk_bytes(mut self, min_free_disk_bytes: u64) -> Self {
+        self.min_free_disk_bytes = min_free_disk_bytes;
+        self
     }
 }
 
@@ -95,25 +166,32 @@ struct PersistedWalState {
 #[derive(Debug)]
 pub struct EdgeRingWal {
     config: EdgeRingWalConfig,
+    min_free_disk_bytes: u64,
     next_seq_no: u64,
     used_bytes: usize,
     entries: VecDeque<WalBatchEntry>,
     evicted_acked_count: u64,
     evicted_expired_count: u64,
+    evicted_disk_space_count: u64,
     dropped_low_priority_count: u64,
+    disk_write_count: u64,
 }
 
 impl EdgeRingWal {
     /// Initializes an [`EdgeRingWal`] from `config`, reloading any existing persisted WAL entries from disk.
     pub fn new(config: EdgeRingWalConfig) -> Result<Self, CollectorError> {
+        let min_free_disk_bytes = config.min_free_disk_bytes;
         let mut wal = Self {
             config,
+            min_free_disk_bytes,
             next_seq_no: 1,
             used_bytes: 0,
             entries: VecDeque::new(),
             evicted_acked_count: 0,
             evicted_expired_count: 0,
+            evicted_disk_space_count: 0,
             dropped_low_priority_count: 0,
+            disk_write_count: 0,
         };
 
         if let Some(ref path) = wal.config.storage_path {
@@ -139,18 +217,23 @@ impl EdgeRingWal {
     /// Creates an in-memory [`EdgeRingWal`] with the specified capacity and retention bounds.
     #[must_use]
     pub fn in_memory(max_wal_bytes: usize, max_age_secs: u64) -> Self {
+        let min_free_disk_bytes = default_min_free_disk_bytes_from_env();
         Self {
             config: EdgeRingWalConfig {
                 storage_path: None,
                 max_wal_bytes,
                 max_age_secs,
+                min_free_disk_bytes,
             },
+            min_free_disk_bytes,
             next_seq_no: 1,
             used_bytes: 0,
             entries: VecDeque::new(),
             evicted_acked_count: 0,
             evicted_expired_count: 0,
+            evicted_disk_space_count: 0,
             dropped_low_priority_count: 0,
+            disk_write_count: 0,
         }
     }
 
@@ -164,7 +247,16 @@ impl EdgeRingWal {
             storage_path: Some(path.into()),
             max_wal_bytes,
             max_age_secs,
+            min_free_disk_bytes: default_min_free_disk_bytes_from_env(),
         })
+    }
+
+    /// Configures `min_free_disk_bytes` on this [`EdgeRingWal`] instance.
+    #[must_use]
+    pub const fn with_min_free_disk_bytes(mut self, min_free_disk_bytes: u64) -> Self {
+        self.config.min_free_disk_bytes = min_free_disk_bytes;
+        self.min_free_disk_bytes = min_free_disk_bytes;
+        self
     }
 
     /// Appends a scrubbed batch using the current system wall-clock timestamp.
@@ -178,7 +270,8 @@ impl EdgeRingWal {
         self.append_at(msg_type, flags, priority, payload, now_unix_secs())
     }
 
-    /// Appends a scrubbed batch at `now_secs`, enforcing `max_wal_bytes` and `max_age_secs`.
+    /// Appends a scrubbed batch at `now_secs`, enforcing strict FIFO eviction by TTL (`max_age_secs`),
+    /// physical disk space (`min_free_disk_bytes`), and `max_wal_bytes`.
     ///
     /// Returns `Ok(Some(seq_no))` when the batch is persisted, or `Ok(None)` if the incoming batch
     /// is low-priority (`LowDebugLog`) and dropped under backpressure to preserve higher-priority batches.
@@ -198,7 +291,19 @@ impl EdgeRingWal {
             )));
         }
 
-        // Step 1: Always prune acknowledged and expired batches first when space is needed.
+        // Step 1: Strict FIFO eviction of expired batches from the front by timestamp.
+        while let Some(front) = self.entries.front() {
+            if now_secs.saturating_sub(front.created_at_secs) > self.config.max_age_secs {
+                if let Some(removed) = self.entries.pop_front() {
+                    self.used_bytes = self.used_bytes.saturating_sub(removed.payload.len());
+                    self.evicted_expired_count += 1;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Prune acknowledged and any remaining expired batches when space is needed.
         if self.used_bytes + batch_len > self.config.max_wal_bytes {
             self.evict_acknowledged();
         }
@@ -206,7 +311,22 @@ impl EdgeRingWal {
             self.evict_expired(now_secs);
         }
 
-        // Step 2: Priority-aware backpressure eviction.
+        // Step 2: Strict FIFO eviction when available physical disk space is below `min_free_disk_bytes`.
+        // Evicts oldest entries from `front` until space is recovered or only the incoming entry remains.
+        if self.is_disk_space_below_threshold() {
+            self.evict_acknowledged();
+            while !self.entries.is_empty() && self.is_disk_space_below_threshold() {
+                if let Some(removed) = self.entries.pop_front() {
+                    self.used_bytes = self.used_bytes.saturating_sub(removed.payload.len());
+                    self.evicted_disk_space_count += 1;
+                    if removed.priority == WalSignalPriority::LowDebugLog {
+                        self.dropped_low_priority_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Step 3: Capacity & priority-aware FIFO eviction when `used_bytes + batch_len > max_wal_bytes`.
         if self.used_bytes + batch_len > self.config.max_wal_bytes {
             if priority == WalSignalPriority::LowDebugLog {
                 // Incoming debug log may only evict older LowDebugLog entries, never spans/metrics/errors/tests/benchmarks.
@@ -229,15 +349,14 @@ impl EdgeRingWal {
                     }
                 }
             } else {
-                // Higher-priority incoming batch: evict LowDebugLog first, then StandardSignal, then oldest HighCritical.
+                // Evict oldest LowDebugLog entries first if present, then strict FIFO (`pop_front()`).
                 while self.used_bytes + batch_len > self.config.max_wal_bytes {
                     if self.evict_oldest_with_priority(WalSignalPriority::LowDebugLog) {
                         continue;
                     }
-                    if self.evict_oldest_with_priority(WalSignalPriority::StandardSignal) {
-                        continue;
-                    }
-                    if !self.evict_oldest_with_priority(WalSignalPriority::HighCritical) {
+                    if let Some(removed) = self.entries.pop_front() {
+                        self.used_bytes = self.used_bytes.saturating_sub(removed.payload.len());
+                    } else {
                         break;
                     }
                 }
@@ -283,9 +402,17 @@ impl EdgeRingWal {
         Ok(found)
     }
 
-    /// Marks `seq_no` as acknowledged and immediately truncates all acknowledged batches from the WAL.
+    /// Marks `seq_no` as acknowledged and immediately truncates all acknowledged batches from the WAL,
+    /// writing to disk at most once and truncating the WAL file to 0 bytes when empty.
     pub fn acknowledge_and_truncate(&mut self, seq_no: u64) -> Result<bool, CollectorError> {
-        let found = self.acknowledge(seq_no)?;
+        let mut found = false;
+        for entry in &mut self.entries {
+            if entry.seq_no == seq_no {
+                entry.acked = true;
+                found = true;
+                break;
+            }
+        }
         if found {
             self.evict_acknowledged();
             self.persist_to_disk()?;
@@ -335,6 +462,12 @@ impl EdgeRingWal {
         self.config.max_wal_bytes
     }
 
+    /// Configured minimum free physical disk bytes threshold.
+    #[must_use]
+    pub const fn min_free_disk_bytes(&self) -> u64 {
+        self.min_free_disk_bytes
+    }
+
     /// Number of batches currently in the WAL.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -371,10 +504,37 @@ impl EdgeRingWal {
         self.evicted_expired_count
     }
 
+    /// Count of batches evicted due to available physical disk space falling below `min_free_disk_bytes`.
+    #[must_use]
+    pub const fn evicted_disk_space_count(&self) -> u64 {
+        self.evicted_disk_space_count
+    }
+
+    /// Count of disk write/truncation operations performed by this WAL instance.
+    #[must_use]
+    pub const fn disk_write_count(&self) -> u64 {
+        self.disk_write_count
+    }
+
     /// Optional disk path backing this WAL.
     #[must_use]
     pub fn storage_path(&self) -> Option<&Path> {
         self.config.storage_path.as_deref()
+    }
+
+    fn is_disk_space_below_threshold(&self) -> bool {
+        if self.min_free_disk_bytes == 0 {
+            return false;
+        }
+        let probe_path = match self.config.storage_path.as_deref() {
+            Some(path) => Some(path),
+            None if self.min_free_disk_bytes > DEFAULT_MIN_FREE_DISK_BYTES => Some(Path::new(".")),
+            None => None,
+        };
+        let Some(path) = probe_path else {
+            return false;
+        };
+        available_disk_bytes(path).is_some_and(|avail| avail < self.min_free_disk_bytes)
     }
 
     fn evict_acknowledged(&mut self) -> usize {
@@ -423,7 +583,7 @@ impl EdgeRingWal {
         false
     }
 
-    fn persist_to_disk(&self) -> Result<(), CollectorError> {
+    fn persist_to_disk(&mut self) -> Result<(), CollectorError> {
         let Some(ref path) = self.config.storage_path else {
             return Ok(());
         };
@@ -431,6 +591,11 @@ impl EdgeRingWal {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
+        }
+        self.disk_write_count += 1;
+        if self.entries.is_empty() {
+            let _ = fs::File::create(path)?;
+            return Ok(());
         }
         let state = PersistedWalState {
             next_seq_no: self.next_seq_no,
@@ -650,5 +815,141 @@ mod tests {
         assert_eq!(pending[0].seq_no, 2);
         assert_eq!(pending[0].payload, b"batch-2");
         assert_eq!(reloaded.next_seq_no(), 3);
+    }
+
+    #[test]
+    fn test_wal_strict_fifo_eviction_by_ttl_max_wal_bytes_and_min_free_disk_bytes() {
+        assert_eq!(DEFAULT_MIN_FREE_DISK_BYTES, 512 * 1024 * 1024);
+
+        // 1. Strict FIFO eviction by TTL even when under max_wal_bytes
+        let mut wal = EdgeRingWal::in_memory(1024, 30);
+        wal.append_at(
+            MSG_TYPE_ARROW_OTEL_SPANS,
+            0,
+            WalSignalPriority::StandardSignal,
+            vec![1u8; 32],
+            100,
+        )
+        .unwrap();
+        wal.append_at(
+            MSG_TYPE_ARROW_OTEL_SPANS,
+            0,
+            WalSignalPriority::StandardSignal,
+            vec![2u8; 32],
+            120,
+        )
+        .unwrap();
+        // At t=135, seq 1 (created at 100) is expired (135 - 100 = 35 > 30), seq 2 is still valid
+        wal.append_at(
+            MSG_TYPE_ARROW_OTEL_SPANS,
+            0,
+            WalSignalPriority::StandardSignal,
+            vec![3u8; 32],
+            135,
+        )
+        .unwrap();
+        assert_eq!(wal.evicted_expired_count(), 1);
+        let seqs: Vec<u64> = wal
+            .pending_batches()
+            .into_iter()
+            .map(|e| e.seq_no)
+            .collect();
+        assert_eq!(seqs, vec![2, 3]);
+
+        // 2. Strict FIFO eviction by max_wal_bytes
+        let mut cap_wal = EdgeRingWal::in_memory(80, 3600);
+        for i in 1..=3u64 {
+            cap_wal
+                .append_at(
+                    MSG_TYPE_ARROW_OTEL_SPANS,
+                    0,
+                    WalSignalPriority::StandardSignal,
+                    vec![i as u8; 40],
+                    200 + i,
+                )
+                .unwrap();
+        }
+        let cap_seqs: Vec<u64> = cap_wal
+            .pending_batches()
+            .into_iter()
+            .map(|e| e.seq_no)
+            .collect();
+        assert_eq!(cap_seqs, vec![2, 3]);
+
+        // 3. Strict FIFO eviction when available disk space is below min_free_disk_bytes
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("wal_disk_pressure.duckdb");
+        assert!(available_disk_bytes(&wal_path).is_some());
+
+        let mut disk_wal = EdgeRingWal::open(&wal_path, 4096, 3600)
+            .expect("open disk wal")
+            .with_min_free_disk_bytes(u64::MAX);
+        assert_eq!(disk_wal.min_free_disk_bytes(), u64::MAX);
+
+        disk_wal
+            .append_at(
+                MSG_TYPE_ARROW_OTEL_SPANS,
+                0,
+                WalSignalPriority::StandardSignal,
+                vec![0x11; 32],
+                300,
+            )
+            .unwrap();
+        disk_wal
+            .append_at(
+                MSG_TYPE_ARROW_OTEL_SPANS,
+                0,
+                WalSignalPriority::StandardSignal,
+                vec![0x22; 32],
+                301,
+            )
+            .unwrap();
+
+        // Because available_disk_bytes < u64::MAX, oldest entry (seq 1) is evicted from front
+        // and only the incoming entry (seq 2) remains.
+        assert_eq!(disk_wal.evicted_disk_space_count(), 1);
+        let remaining = disk_wal.pending_batches();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].seq_no, 2);
+    }
+
+    #[test]
+    fn test_wal_acknowledge_and_truncate_single_write_and_zero_byte_empty_truncation() {
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("wal_single_write.duckdb");
+
+        let mut wal = EdgeRingWal::open(&wal_path, 4096, 3600).expect("open wal");
+        let s1 = wal
+            .append_at(
+                MSG_TYPE_ARROW_OTEL_SPANS,
+                0,
+                WalSignalPriority::StandardSignal,
+                b"payload-1".to_vec(),
+                1000,
+            )
+            .unwrap()
+            .unwrap();
+        let s2 = wal
+            .append_at(
+                MSG_TYPE_ARROW_OTEL_SPANS,
+                0,
+                WalSignalPriority::StandardSignal,
+                b"payload-2".to_vec(),
+                1001,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(wal.disk_write_count(), 2);
+
+        // Acknowledge and truncate s1: must write to disk exactly ONCE (disk_write_count: 2 -> 3)
+        assert!(wal.acknowledge_and_truncate(s1).unwrap());
+        assert_eq!(wal.disk_write_count(), 3);
+        assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+
+        // Acknowledge and truncate s2: WAL is now empty -> single write truncates file to 0 bytes
+        assert!(wal.acknowledge_and_truncate(s2).unwrap());
+        assert_eq!(wal.disk_write_count(), 4);
+        assert!(wal.is_empty());
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
     }
 }
