@@ -24,8 +24,10 @@ Sandboxed node-level edge telemetry collector for the **MuObserve** distributed 
   - High-throughput zero-copy Apache Arrow IPC ingestion for `ActionRunner-rs`, `ActionRunner-tools`, `MuConDe-agent`, and `k3-manager`.
 - **Streaming Edge Secret Redaction**:
   - Deterministic scrubbing of bearer tokens, webhook secrets, API keys, and PEM private keys before any record touches the local Edge WAL or leaves the node.
-- **Bounded Edge Ring-Buffer WAL**:
-  - Local DuckDB/Arrow write-ahead ring buffer (`/var/lib/muobserve-collector/wal.duckdb`, default `<= 256 MiB` / `24h`) providing zero-data-loss resilience across network partitions with priority-aware backpressure eviction.
+- **Single-Line Normalization & Bounded FIFO Line Deduplication**:
+  - Splits multi-line log payloads on `\n` into single-line `OtelLogEntry` records with `"line_no"` and `"stream"` metadata in `attributes_json` and deduplicates repeated lines via a 64-bit FNV-1a `dedup_hash` ring (`16,384` entries) before hitting the local WAL.
+- **Bounded Edge Ring-Buffer WAL & Strict FIFO Disk-Space Eviction**:
+  - Local write-ahead ring buffer (`/var/lib/muobserve-collector/wal.duckdb`, default `<= 256 MiB` / `24h`) enforcing strict FIFO (`pop_front`) eviction by TTL, `max_wal_bytes`, and remaining physical disk space (`libc::statvfs` vs `MUOBSERVE_MIN_FREE_DISK_BYTES`, default `512 MiB`), with zero-byte direct truncation when all batches are acknowledged. See [`specs/edge-line-dedup-and-fifo-wal-eviction.md`](specs/edge-line-dedup-and-fifo-wal-eviction.md).
 - **Zero-Trust `step-ca` mTLS Upstream Streaming & `MuIsolation`**:
   - Streams compressed Arrow & Fory batches over `rustls` mutual TLS to the central `MuObserve` server with cryptographic client certificate SAN attribution, confined under `MuIsolation` (`KernelSandbox`: Landlock V3+ & `cgroupv2`).
 
