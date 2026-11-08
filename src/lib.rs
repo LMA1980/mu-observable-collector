@@ -31,14 +31,17 @@ pub use forwarder::{
 #[cfg(unix)]
 pub use ingest::serve_muob_unix_once;
 pub use ingest::{
-    build_otlp_router, handle_muob_connection, parse_otlp_logs_json, parse_otlp_metrics_json,
-    parse_otlp_traces_json, serve_muob_tcp_listener, serve_muob_tcp_once, CollectorIngestState,
-    IngestConfig, OtlpIngestResponse, DEFAULT_MUOB_TCP_ADDR, DEFAULT_OTLP_HTTP_ADDR,
+    build_otlp_router, compute_log_dedup_hash, handle_muob_connection, normalize_single_line_logs,
+    parse_otlp_logs_json, parse_otlp_metrics_json, parse_otlp_traces_json, serve_muob_tcp_listener,
+    serve_muob_tcp_once, CollectorIngestState, IngestBatchOutcome, IngestConfig, IngestState,
+    LineDeduplicator, OtlpIngestResponse, DEFAULT_LOG_DEDUP_CAPACITY, DEFAULT_MUOB_TCP_ADDR,
+    DEFAULT_OTLP_HTTP_ADDR,
 };
 pub use scrubber::{is_high_priority_log, EdgeSecretScrubber, ScrubbedArrowBatch};
 pub use wal::{
-    now_unix_secs, EdgeRingWal, EdgeRingWalConfig, WalBatchEntry, WalSignalPriority,
-    DEFAULT_MAX_AGE_SECS, DEFAULT_MAX_WAL_BYTES, DEFAULT_WAL_PATH,
+    available_disk_bytes, default_min_free_disk_bytes_from_env, now_unix_secs, EdgeRingWal,
+    EdgeRingWalConfig, WalBatchEntry, WalSignalPriority, DEFAULT_MAX_AGE_SECS,
+    DEFAULT_MAX_WAL_BYTES, DEFAULT_MIN_FREE_DISK_BYTES, DEFAULT_WAL_PATH,
 };
 
 // Re-exports & compatibility aliases for `mu-observable-ipc` wire types
