@@ -928,7 +928,7 @@ dependencies = [
 [[package]]
 name = "mu-ci-isolation"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-ci-isolation.git?branch=feat%2Fm8-naming-alignment#98117ee3d6270c6ca9f290c2881515db65d7147b"
+source = "git+https://github.com/LMA1980/mu-ci-isolation.git?branch=main#af87fb6015ad0c0deddc1b5d2a945c4b3c87bc03"
 dependencies = [
  "landlock",
  "libc",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "mu-observable-collector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "axum",
@@ -970,7 +970,7 @@ dependencies = [
 [[package]]
 name = "mu-observable-ipc"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=feat%2Fm8-naming-alignment#28793ce66732461cb68c3aef3006154939265abb"
+source = "git+https://github.com/LMA1980/mu-observable-ipc.git?branch=main#8ae17bcca3ddbd3566e40f1b364afd487306f80c"
 dependencies = [
  "arrow",
  "bytes",
