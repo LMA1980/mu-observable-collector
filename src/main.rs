@@ -39,10 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let serve_mode = std::env::args().any(|a| a == "serve" || a == "--serve")
-        || std::env::var("MUOBSERVE_COLLECTOR_SERVE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+    let has_explicit_subcommand = std::env::args()
+        .nth(1)
+        .is_some_and(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"));
+    let serve_mode = !has_explicit_subcommand;
 
     if serve_mode {
         let wal = if let Ok(path) = std::env::var("MUOBSERVE_WAL_PATH") {
@@ -52,16 +52,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let wal = Arc::new(Mutex::new(wal));
 
-        if let Ok(upstream_addr) = std::env::var("MUOBSERVE_UPSTREAM_ADDR") {
+        let upstream_addr_opt = std::env::var("MUOBSERVE_UPSTREAM_ADDR")
+            .or_else(|_| std::env::var("MUOBSERVE_UPSTREAM_URL"))
+            .ok()
+            .map(|raw| {
+                let trimmed = raw.trim();
+                let stripped = trimmed
+                    .strip_prefix("https://")
+                    .or_else(|| trimmed.strip_prefix("http://"))
+                    .unwrap_or(trimmed);
+                stripped.trim_end_matches('/').to_string()
+            });
+
+        if let Some(upstream_addr) = upstream_addr_opt {
             let server_name =
                 std::env::var("MUOBSERVE_SERVER_NAME").unwrap_or_else(|_| "node-a".to_string());
-            let ca_cert_path = std::env::var("MUOBSERVE_CA_CERT")
+            let ca_cert_path = std::env::var("MUOBSERVE_TLS_CA")
+                .or_else(|_| std::env::var("MUOBSERVE_CA_CERT"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/etc/muobserve-collector/tls/ca.crt"));
-            let client_cert_path = std::env::var("MUOBSERVE_CLIENT_CERT")
+            let client_cert_path = std::env::var("MUOBSERVE_TLS_CERT")
+                .or_else(|_| std::env::var("MUOBSERVE_CLIENT_CERT"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/etc/muobserve-collector/tls/client.crt"));
-            let client_key_path = std::env::var("MUOBSERVE_CLIENT_KEY")
+            let client_key_path = std::env::var("MUOBSERVE_TLS_KEY")
+                .or_else(|_| std::env::var("MUOBSERVE_CLIENT_KEY"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/etc/muobserve-collector/tls/client.key"));
 
