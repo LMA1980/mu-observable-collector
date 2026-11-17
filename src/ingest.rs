@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mu_observable_ipc::{
-    create_fory_registry, encode_log_batch, encode_metric_batch, encode_span_batch, read_frame,
+    encode_log_batch, encode_metric_batch, encode_span_batch, read_frame, shared_fory_registry,
     write_frame, IpcHeader, OtelLogEntry, OtelMetricEntry, OtelSpanEntry, WalBatchAck,
     FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_ARROW_OTEL_METRICS,
     MSG_TYPE_ARROW_OTEL_SPANS, MSG_TYPE_WAL_ACK,
@@ -1040,8 +1040,9 @@ pub async fn handle_muob_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let fory = create_fory_registry()?;
+    let fory = shared_fory_registry()?;
     let mut processed_frames = 0u64;
+    let mut ack_bytes = Vec::new();
 
     loop {
         let (header, payload) = match read_frame(&mut stream).await {
@@ -1075,8 +1076,8 @@ where
             },
         };
 
-        let ack_bytes = fory
-            .serialize(&ack)
+        ack_bytes.clear();
+        fory.serialize_to(&mut ack_bytes, &ack)
             .map_err(mu_observable_ipc::IpcError::Fory)?;
         let ack_len = u32::try_from(ack_bytes.len()).unwrap_or(u32::MAX);
         let ack_hdr = IpcHeader::new(MSG_TYPE_WAL_ACK, ack_len, 0, header.sequence);
@@ -1350,7 +1351,7 @@ mod tests {
 
         let (ack_hdr, ack_payload) = read_frame(&mut client).await.unwrap();
         assert_eq!(ack_hdr.msg_type, MSG_TYPE_WAL_ACK);
-        let fory = create_fory_registry().unwrap();
+        let fory = shared_fory_registry().unwrap();
         let ack: WalBatchAck = fory.deserialize(&ack_payload).unwrap();
         assert!(ack.ok);
         assert_eq!(ack.accepted_rows, 1);
@@ -1490,5 +1491,226 @@ mod tests {
         let dup_pass = state.normalize_and_dedup_logs(vec![entry]);
         assert!(dup_pass.is_empty());
         assert_eq!(state.dropped_duplicate_logs(), 3);
+    }
+
+    #[test]
+    fn test_shared_fory_registry_wal_batch_ack_roundtrip_and_buffer_reuse() {
+        let reg1 = shared_fory_registry().expect("shared registry 1");
+        let reg2 = shared_fory_registry().expect("shared registry 2");
+        assert!(
+            std::ptr::eq(reg1, reg2),
+            "shared_fory_registry must return a single static Fory instance"
+        );
+
+        let acks = [
+            WalBatchAck {
+                sequence: 1,
+                accepted_rows: 0,
+                ok: false,
+                error_message: Some(
+                    "Dropped low-priority batch due to WAL backpressure".to_string(),
+                ),
+            },
+            WalBatchAck {
+                sequence: 2,
+                accepted_rows: 12,
+                ok: true,
+                error_message: None,
+            },
+            WalBatchAck {
+                sequence: 3,
+                accepted_rows: 0,
+                ok: false,
+                error_message: Some("short err".to_string()),
+            },
+            WalBatchAck {
+                sequence: 4,
+                accepted_rows: 256,
+                ok: true,
+                error_message: None,
+            },
+        ];
+
+        let mut ack_bytes = Vec::new();
+        let mut high_water_ptr = None;
+        let mut high_water_cap = 0usize;
+
+        for ack in &acks {
+            ack_bytes.clear();
+            let written = reg1
+                .serialize_to(&mut ack_bytes, ack)
+                .expect("serialize_to WalBatchAck");
+            assert_eq!(written, ack_bytes.len());
+
+            if high_water_ptr.is_none() {
+                high_water_ptr = Some(ack_bytes.as_ptr());
+                high_water_cap = ack_bytes.capacity();
+            } else {
+                // Buffer capacity established by the initial rejected ack is reused without reallocation.
+                assert_eq!(Some(ack_bytes.as_ptr()), high_water_ptr);
+                assert_eq!(ack_bytes.capacity(), high_water_cap);
+            }
+
+            let legacy_bytes = reg2.serialize(ack).expect("serialize WalBatchAck");
+            assert_eq!(
+                ack_bytes, legacy_bytes,
+                "serialize_to must match serialize byte-for-byte with no stale trailing bytes"
+            );
+
+            let decoded: WalBatchAck = reg2
+                .deserialize(&ack_bytes)
+                .expect("deserialize WalBatchAck");
+            assert_eq!(decoded, *ack);
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_handle_muob_connection_repeated_connections_and_mixed_ack_sizes() {
+        let tiny_wal = Arc::new(Mutex::new(EdgeRingWal::in_memory(8 * 1024, 3600)));
+        let scrubber = Arc::new(EdgeSecretScrubber::new());
+        let state = CollectorIngestState::new(tiny_wal, scrubber, "worker-riscv64", "riscv64gc");
+        let caller_reg = shared_fory_registry().expect("shared registry in caller");
+
+        // Connection 1: fill WAL, emit a backpressure rejection ACK (longer payload),
+        // then emit a high-priority accepted ACK (shorter payload) on the same connection
+        // to verify caller-owned buffer clear + reuse across frame sizes.
+        let (mut client1, server1) = tokio::io::duplex(64 * 1024);
+        let state1 = state.clone();
+        let server_task1 =
+            tokio::spawn(async move { handle_muob_connection(server1, state1).await.unwrap() });
+
+        for seq in 1..=10u64 {
+            let span = OtelSpanEntry {
+                trace_id: format!("trace_{seq:032x}"),
+                span_id: format!("span_{seq:016x}"),
+                parent_span_id: None,
+                service_name: "mu-ci-worker".to_string(),
+                node_id: "worker-riscv64".to_string(),
+                span_name: format!("span_{seq}"),
+                span_kind: "INTERNAL".to_string(),
+                start_time_unix_nano: 1_700_000_000_000_000_000 + i64::try_from(seq).unwrap(),
+                end_time_unix_nano: 1_700_000_001_000_000_000 + i64::try_from(seq).unwrap(),
+                duration_ns: 1_000_000_000,
+                status_code: "OK".to_string(),
+                status_message: None,
+                attributes_json: "{}".to_string(),
+            };
+            let payload = encode_span_batch(&[span]).unwrap();
+            let hdr = IpcHeader::new(
+                MSG_TYPE_ARROW_OTEL_SPANS,
+                u32::try_from(payload.len()).unwrap(),
+                0,
+                seq,
+            );
+            write_frame(&mut client1, &hdr, &payload).await.unwrap();
+            let (ack_hdr, ack_payload) = read_frame(&mut client1).await.unwrap();
+            assert_eq!(ack_hdr.msg_type, MSG_TYPE_WAL_ACK);
+            assert_eq!(ack_hdr.sequence, seq);
+            let ack: WalBatchAck = caller_reg.deserialize(&ack_payload).unwrap();
+            assert!(ack.ok);
+            assert_eq!(ack.error_message, None);
+        }
+
+        // Low-priority debug log should be dropped under WAL backpressure (larger ACK payload).
+        let debug_log = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_050_000_000_000,
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            severity_number: 5,
+            severity_text: "DEBUG".to_string(),
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "worker-riscv64".to_string(),
+            body: "debug log dropped under backpressure".to_string(),
+            attributes_json: "{}".to_string(),
+            job_id: Some("job-bp".to_string()),
+            stage_id: Some("test".to_string()),
+        };
+        let debug_payload = encode_log_batch(&[debug_log]).unwrap();
+        let debug_hdr = IpcHeader::new(
+            MSG_TYPE_ARROW_OTEL_LOGS,
+            u32::try_from(debug_payload.len()).unwrap(),
+            0,
+            200,
+        );
+        write_frame(&mut client1, &debug_hdr, &debug_payload)
+            .await
+            .unwrap();
+        let (rej_hdr, rej_payload) = read_frame(&mut client1).await.unwrap();
+        assert_eq!(rej_hdr.msg_type, MSG_TYPE_WAL_ACK);
+        assert_eq!(rej_hdr.sequence, 200);
+        let rej_ack: WalBatchAck = caller_reg.deserialize(&rej_payload).unwrap();
+        assert!(!rej_ack.ok);
+        assert_eq!(rej_ack.accepted_rows, 0);
+        assert_eq!(
+            rej_ack.error_message.as_deref(),
+            Some("Dropped low-priority batch due to WAL backpressure")
+        );
+
+        // High-priority test run on the SAME connection must shrink-reuse ack_bytes cleanly.
+        let hp_run = TestCaseRunEntry {
+            job_id: "job-hp".to_string(),
+            repo_key: "lma1980/mu-observable-collector".to_string(),
+            branch_key: "main".to_string(),
+            commit_sha: "abcdef12".to_string(),
+            crate_name: "mu-observable-collector".to_string(),
+            test_binary: "ingest".to_string(),
+            test_name: "test_reuse".to_string(),
+            status: "passed".to_string(),
+            duration_ms: 1.5,
+            failure_summary: None,
+            timestamp_unix_nano: 1_700_000_060_000_000_000,
+            node_id: "worker-riscv64".to_string(),
+            arch: "riscv64gc".to_string(),
+        };
+        let hp_payload = encode_test_run_batch(std::slice::from_ref(&hp_run)).unwrap();
+        let hp_hdr = IpcHeader::new(
+            MSG_TYPE_ARROW_TEST_RUNS,
+            u32::try_from(hp_payload.len()).unwrap(),
+            FLAG_HIGH_PRIORITY,
+            201,
+        );
+        write_frame(&mut client1, &hp_hdr, &hp_payload)
+            .await
+            .unwrap();
+        let (hp_ack_hdr, hp_ack_payload) = read_frame(&mut client1).await.unwrap();
+        assert_eq!(hp_ack_hdr.msg_type, MSG_TYPE_WAL_ACK);
+        assert_eq!(hp_ack_hdr.sequence, 201);
+        assert!(hp_ack_payload.len() < rej_payload.len());
+        let hp_ack: WalBatchAck = caller_reg.deserialize(&hp_ack_payload).unwrap();
+        assert!(hp_ack.ok);
+        assert_eq!(hp_ack.accepted_rows, 1);
+        assert_eq!(hp_ack.error_message, None);
+
+        drop(client1);
+        assert_eq!(server_task1.await.unwrap(), 12);
+
+        // Connection 2: confirm repeated handle_muob_connection invocations reuse shared registry.
+        let (mut client2, server2) = tokio::io::duplex(64 * 1024);
+        let server_task2 =
+            tokio::spawn(async move { handle_muob_connection(server2, state).await.unwrap() });
+        let hp_payload2 = encode_test_run_batch(&[hp_run]).unwrap();
+        let hp_hdr2 = IpcHeader::new(
+            MSG_TYPE_ARROW_TEST_RUNS,
+            u32::try_from(hp_payload2.len()).unwrap(),
+            FLAG_HIGH_PRIORITY,
+            301,
+        );
+        write_frame(&mut client2, &hp_hdr2, &hp_payload2)
+            .await
+            .unwrap();
+        let (ack2_hdr, ack2_payload) = read_frame(&mut client2).await.unwrap();
+        assert_eq!(ack2_hdr.sequence, 301);
+        let ack2: WalBatchAck = caller_reg.deserialize(&ack2_payload).unwrap();
+        assert!(ack2.ok);
+        assert_eq!(ack2.accepted_rows, 1);
+        assert_eq!(ack2.error_message, None);
+
+        drop(client2);
+        assert_eq!(server_task2.await.unwrap(), 1);
+        assert!(std::ptr::eq(
+            caller_reg,
+            shared_fory_registry().expect("shared registry still identical")
+        ));
     }
 }
