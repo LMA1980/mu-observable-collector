@@ -7,7 +7,7 @@ use mu_ci_isolation::{
     NetworkEgressMode, SandboxBackendKind, SandboxExecutionPlan,
 };
 use mu_observable_ipc::{
-    create_fory_registry, decode_control_envelope, read_frame, write_frame, ControlRpcEnvelope,
+    decode_control_envelope, read_frame, shared_fory_registry, write_frame, ControlRpcEnvelope,
     IpcHeader, WalBatchAck, MSG_TYPE_FORY_CONTROL, MSG_TYPE_WAL_ACK,
 };
 use rustls::pki_types::pem::PemObject;
@@ -277,7 +277,7 @@ impl MtlsForwarder {
             return Ok(0);
         }
 
-        let fory = create_fory_registry()?;
+        let fory = shared_fory_registry()?;
         let mut acked_count = 0usize;
 
         for batch in pending {
@@ -288,7 +288,7 @@ impl MtlsForwarder {
             write_frame(stream, &header, &batch.payload).await?;
 
             let (ack_hdr, ack_payload) = read_frame(stream).await?;
-            let ack = decode_wal_ack_frame(&fory, ack_hdr.msg_type, &ack_payload)?;
+            let ack = decode_wal_ack_frame(fory, ack_hdr.msg_type, &ack_payload)?;
 
             if !ack.ok {
                 return Err(CollectorError::UpstreamRejected(
@@ -547,8 +547,9 @@ mod tests {
                 .expect("client must present mTLS cert");
             assert!(!peer_certs.is_empty());
 
-            let fory = create_fory_registry().unwrap();
+            let fory = shared_fory_registry().unwrap();
             let mut received_seqs = Vec::new();
+            let mut ack_bytes = Vec::new();
 
             for expected_seq in 1..=2u64 {
                 let (hdr, payload) = read_frame(&mut tls).await.expect("read frame");
@@ -565,7 +566,8 @@ mod tests {
                     ok: true,
                     error_message: None,
                 };
-                let ack_bytes = fory.serialize(&ack).unwrap();
+                ack_bytes.clear();
+                fory.serialize_to(&mut ack_bytes, &ack).unwrap();
                 let ack_hdr = IpcHeader::new(
                     MSG_TYPE_WAL_ACK,
                     u32::try_from(ack_bytes.len()).unwrap(),
@@ -605,5 +607,165 @@ mod tests {
         assert!(wal_guard.pending_batches().is_empty());
         assert_eq!(wal_guard.used_bytes(), 0);
         assert_eq!(wal_guard.evicted_acked_count(), 2);
+    }
+
+    #[test]
+    fn test_shared_fory_registry_singleton_and_decode_wal_ack_roundtrip() {
+        let reg1 = shared_fory_registry().expect("shared registry 1");
+        let reg2 = shared_fory_registry().expect("shared registry 2");
+        assert!(
+            std::ptr::eq(reg1, reg2),
+            "shared_fory_registry must return a single static Fory instance"
+        );
+
+        let samples = [
+            WalBatchAck {
+                sequence: 42,
+                accepted_rows: 0,
+                ok: false,
+                error_message: Some(
+                    "Dropped low-priority batch due to WAL backpressure".to_string(),
+                ),
+            },
+            WalBatchAck {
+                sequence: 43,
+                accepted_rows: 17,
+                ok: true,
+                error_message: None,
+            },
+            WalBatchAck {
+                sequence: 44,
+                accepted_rows: 3,
+                ok: false,
+                error_message: Some("retry".to_string()),
+            },
+        ];
+
+        let mut buf = Vec::new();
+        let mut initial_ptr = None;
+        let mut initial_cap = 0usize;
+
+        for ack in &samples {
+            buf.clear();
+            let written = reg1
+                .serialize_to(&mut buf, ack)
+                .expect("serialize_to WalBatchAck");
+            assert_eq!(written, buf.len());
+
+            if initial_ptr.is_none() {
+                initial_ptr = Some(buf.as_ptr());
+                initial_cap = buf.capacity();
+            } else {
+                // Subsequent smaller/equal payloads reuse the same caller-owned buffer.
+                assert_eq!(Some(buf.as_ptr()), initial_ptr);
+                assert_eq!(buf.capacity(), initial_cap);
+            }
+
+            let legacy_bytes = reg2.serialize(ack).expect("serialize WalBatchAck");
+            assert_eq!(
+                buf, legacy_bytes,
+                "serialize_to must produce byte-identical output to serialize"
+            );
+
+            let decoded =
+                decode_wal_ack_frame(reg1, MSG_TYPE_WAL_ACK, &buf).expect("decode_wal_ack_frame");
+            assert_eq!(decoded, *ack);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn test_forward_over_stream_repeated_cycles_reuse_shared_registry() {
+        let dir = tempdir().expect("tempdir");
+        let pki = generate_ephemeral_mtls_pki(dir.path());
+        let wal = Arc::new(Mutex::new(EdgeRingWal::in_memory(1024 * 1024, 3600)));
+
+        let fwd_cfg = MtlsForwarderConfig {
+            upstream_addr: "127.0.0.1:0".to_string(),
+            server_name: "node-a".to_string(),
+            ca_cert_path: pki.ca_path,
+            client_cert_path: pki.client_cert_path,
+            client_key_path: pki.client_key_path,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 50,
+            max_retries: 1,
+        };
+        let forwarder = MtlsForwarder::new(fwd_cfg, wal.clone()).expect("create forwarder");
+
+        let sample_log = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_000_000_000_000,
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            severity_number: 17,
+            severity_text: "ERROR".to_string(),
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "worker-riscv64".to_string(),
+            body: "build stage log".to_string(),
+            attributes_json: r#"{"stage":"test"}"#.to_string(),
+            job_id: Some("job-repeat".to_string()),
+            stage_id: Some("test".to_string()),
+        };
+        let encoded_batch = encode_log_batch(std::slice::from_ref(&sample_log)).unwrap();
+        let main_reg = shared_fory_registry().expect("shared registry in caller");
+
+        for cycle in 1..=4u64 {
+            {
+                let mut wal_guard = wal.lock().await;
+                wal_guard
+                    .append(
+                        MSG_TYPE_ARROW_OTEL_LOGS,
+                        FLAG_HIGH_PRIORITY,
+                        WalSignalPriority::HighCritical,
+                        encoded_batch.clone(),
+                    )
+                    .unwrap();
+            }
+
+            let (mut client_stream, mut server_stream) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                let server_reg = shared_fory_registry().expect("shared registry in server task");
+                let mut ack_buf = Vec::new();
+
+                let (hdr, payload) = read_frame(&mut server_stream).await.expect("read frame");
+                assert_eq!(hdr.msg_type, MSG_TYPE_ARROW_OTEL_LOGS);
+                assert_eq!(hdr.sequence, cycle);
+                let logs = decode_log_batch(&payload).expect("decode logs");
+                assert_eq!(logs.len(), 1);
+
+                let ack = WalBatchAck {
+                    sequence: hdr.sequence,
+                    accepted_rows: 1,
+                    ok: true,
+                    error_message: None,
+                };
+                ack_buf.clear();
+                server_reg
+                    .serialize_to(&mut ack_buf, &ack)
+                    .expect("serialize_to ack");
+                let ack_hdr = IpcHeader::new(
+                    MSG_TYPE_WAL_ACK,
+                    u32::try_from(ack_buf.len()).unwrap(),
+                    0,
+                    hdr.sequence,
+                );
+                write_frame(&mut server_stream, &ack_hdr, &ack_buf)
+                    .await
+                    .expect("write ack");
+                server_reg as *const fory::Fory as usize
+            });
+
+            let acked = forwarder
+                .forward_over_stream(&mut client_stream)
+                .await
+                .expect("forward_over_stream cycle");
+            assert_eq!(acked, 1);
+
+            let server_reg_addr = server_task.await.expect("server task");
+            assert_eq!(server_reg_addr, main_reg as *const fory::Fory as usize);
+        }
+
+        let wal_guard = wal.lock().await;
+        assert!(wal_guard.pending_batches().is_empty());
+        assert_eq!(wal_guard.evicted_acked_count(), 4);
     }
 }
