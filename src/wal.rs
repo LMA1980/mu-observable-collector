@@ -20,17 +20,33 @@ pub const DEFAULT_MAX_AGE_SECS: u64 = 86_400;
 /// Default minimum free physical disk space in bytes (`512 MiB` = `536_870_912` bytes).
 pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Canonical production Edge WAL path on `MuObserve-collector` nodes.
-pub const DEFAULT_WAL_PATH: &str = "/var/lib/muobserve-collector/wal.duckdb";
+/// Canonical production Edge WAL path on `mu-observable-collector` nodes.
+pub const DEFAULT_WAL_PATH: &str = "/var/lib/mu-observable-collector/wal.duckdb";
+
+/// Resolves the minimum free physical disk space threshold in bytes using `lookup`, preferring
+/// `MU_OBSERVABLE_COLLECTOR_MIN_FREE_DISK_BYTES` with fallback to `MUOBSERVE_MIN_FREE_DISK_BYTES`
+/// and [`DEFAULT_MIN_FREE_DISK_BYTES`] (`512 MiB`).
+pub fn default_min_free_disk_bytes_from_env_with<F>(lookup: F) -> u64
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    crate::env_var_first_with(
+        &[
+            "MU_OBSERVABLE_COLLECTOR_MIN_FREE_DISK_BYTES",
+            "MUOBSERVE_MIN_FREE_DISK_BYTES",
+        ],
+        lookup,
+    )
+    .and_then(|v| v.parse::<u64>().ok())
+    .unwrap_or(DEFAULT_MIN_FREE_DISK_BYTES)
+}
 
 /// Resolves the minimum free physical disk space threshold in bytes from
-/// `MUOBSERVE_MIN_FREE_DISK_BYTES`, falling back to [`DEFAULT_MIN_FREE_DISK_BYTES`] (`512 MiB`).
+/// `MU_OBSERVABLE_COLLECTOR_MIN_FREE_DISK_BYTES` (fallback `MUOBSERVE_MIN_FREE_DISK_BYTES`),
+/// defaulting to [`DEFAULT_MIN_FREE_DISK_BYTES`] (`512 MiB`).
 #[must_use]
 pub fn default_min_free_disk_bytes_from_env() -> u64 {
-    std::env::var("MUOBSERVE_MIN_FREE_DISK_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MIN_FREE_DISK_BYTES)
+    default_min_free_disk_bytes_from_env_with(|k| std::env::var(k).ok())
 }
 
 /// Queries available unprivileged physical disk space in bytes via `libc::statvfs`
@@ -627,6 +643,37 @@ mod tests {
     fn test_default_wal_constants_256_mib() {
         assert_eq!(DEFAULT_MAX_WAL_BYTES, 256 * 1024 * 1024);
         assert_eq!(DEFAULT_MAX_AGE_SECS, 86_400);
+        assert_eq!(
+            DEFAULT_WAL_PATH,
+            "/var/lib/mu-observable-collector/wal.duckdb"
+        );
+    }
+
+    #[test]
+    fn test_min_free_disk_bytes_env_precedence() {
+        use std::collections::HashMap;
+
+        let empty: HashMap<&str, &str> = HashMap::new();
+        assert_eq!(
+            default_min_free_disk_bytes_from_env_with(|k| empty.get(k).map(|v| (*v).to_string())),
+            DEFAULT_MIN_FREE_DISK_BYTES
+        );
+
+        let legacy: HashMap<&str, &str> =
+            HashMap::from([("MUOBSERVE_MIN_FREE_DISK_BYTES", "1048576")]);
+        assert_eq!(
+            default_min_free_disk_bytes_from_env_with(|k| legacy.get(k).map(|v| (*v).to_string())),
+            1_048_576
+        );
+
+        let both: HashMap<&str, &str> = HashMap::from([
+            ("MU_OBSERVABLE_COLLECTOR_MIN_FREE_DISK_BYTES", "2097152"),
+            ("MUOBSERVE_MIN_FREE_DISK_BYTES", "1048576"),
+        ]);
+        assert_eq!(
+            default_min_free_disk_bytes_from_env_with(|k| both.get(k).map(|v| (*v).to_string())),
+            2_097_152
+        );
     }
 
     #[test]

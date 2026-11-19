@@ -16,6 +16,8 @@
 
 #![deny(unsafe_code)]
 
+use std::path::{Path, PathBuf};
+
 pub mod error;
 pub mod forwarder;
 pub mod ingest;
@@ -27,6 +29,7 @@ pub use forwarder::{
     apply_collector_startup_sandbox, build_collector_sandbox_policy, build_tls_client_config,
     build_tls_server_config, decode_wal_ack_frame, CollectorSandboxConfig, MtlsForwarder,
     MtlsForwarderConfig, DEFAULT_COLLECTOR_CONFIG_DIR, DEFAULT_COLLECTOR_STATE_DIR,
+    LEGACY_COLLECTOR_CONFIG_DIR, LEGACY_COLLECTOR_STATE_DIR,
 };
 #[cfg(unix)]
 pub use ingest::serve_muob_unix_once;
@@ -59,6 +62,42 @@ pub use mu_observable_ipc::{
 
 /// Default maximum Edge WAL capacity in megabytes (`256 MiB`).
 pub const DEFAULT_WAL_MAX_MB: usize = 256;
+
+/// Returns the first non-empty trimmed value matching `keys` in precedence order.
+pub fn env_var_first_with<F>(keys: &[&str], mut lookup: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    for key in keys {
+        if let Some(raw) = lookup(key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns the first non-empty trimmed process environment variable matching `keys` in order.
+#[must_use]
+pub fn env_var_first(keys: &[&str]) -> Option<String> {
+    env_var_first_with(keys, |k| std::env::var(k).ok())
+}
+
+/// Resolves `canonical` unless `canonical` does not exist on disk and `legacy` does.
+#[must_use]
+pub fn resolve_preferred_path(canonical: impl AsRef<Path>, legacy: impl AsRef<Path>) -> PathBuf {
+    let canonical = canonical.as_ref();
+    if canonical.exists() {
+        return canonical.to_path_buf();
+    }
+    let legacy = legacy.as_ref();
+    if legacy.exists() {
+        return legacy.to_path_buf();
+    }
+    canonical.to_path_buf()
+}
 
 #[cfg(test)]
 mod tests {
