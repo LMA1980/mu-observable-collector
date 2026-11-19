@@ -54,20 +54,36 @@ impl Default for IngestConfig {
 }
 
 impl IngestConfig {
-    /// Resolves [`IngestConfig`] from `MUOBSERVE_OTLP_HTTP_ADDR` and `MUOBSERVE_MUOB_TCP_ADDR`,
-    /// falling back to defaults [`DEFAULT_OTLP_HTTP_ADDR`] and [`DEFAULT_MUOB_TCP_ADDR`].
+    /// Resolves [`IngestConfig`] from `MU_OBSERVABLE_COLLECTOR_OTLP_HTTP_ADDR` and
+    /// `MU_OBSERVABLE_COLLECTOR_MUOB_TCP_ADDR` (with fallback to `MUOBSERVE_OTLP_HTTP_ADDR` and
+    /// `MUOBSERVE_MUOB_TCP_ADDR`), defaulting to [`DEFAULT_OTLP_HTTP_ADDR`] and [`DEFAULT_MUOB_TCP_ADDR`].
     #[must_use]
     pub fn from_env() -> Self {
-        let otlp_http_addr = std::env::var("MUOBSERVE_OTLP_HTTP_ADDR")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_OTLP_HTTP_ADDR.to_string());
-        let muob_tcp_addr = std::env::var("MUOBSERVE_MUOB_TCP_ADDR")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_MUOB_TCP_ADDR.to_string());
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Resolves [`IngestConfig`] using `lookup`, preferring `MU_OBSERVABLE_COLLECTOR_*` variables
+    /// before falling back to legacy `MUOBSERVE_*` variables.
+    pub fn from_env_with<F>(mut lookup: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let otlp_http_addr = crate::env_var_first_with(
+            &[
+                "MU_OBSERVABLE_COLLECTOR_OTLP_HTTP_ADDR",
+                "MUOBSERVE_OTLP_HTTP_ADDR",
+            ],
+            &mut lookup,
+        )
+        .unwrap_or_else(|| DEFAULT_OTLP_HTTP_ADDR.to_string());
+        let muob_tcp_addr = crate::env_var_first_with(
+            &[
+                "MU_OBSERVABLE_COLLECTOR_MUOB_TCP_ADDR",
+                "MUOBSERVE_MUOB_TCP_ADDR",
+            ],
+            &mut lookup,
+        )
+        .unwrap_or_else(|| DEFAULT_MUOB_TCP_ADDR.to_string());
         Self {
             otlp_http_addr,
             muob_tcp_addr,
@@ -1712,5 +1728,28 @@ mod tests {
             caller_reg,
             shared_fory_registry().expect("shared registry still identical")
         ));
+    }
+
+    #[test]
+    fn test_ingest_config_canonical_and_legacy_precedence() {
+        use std::collections::HashMap;
+
+        let legacy: HashMap<&str, &str> = HashMap::from([
+            ("MUOBSERVE_OTLP_HTTP_ADDR", "127.0.0.1:14318"),
+            ("MUOBSERVE_MUOB_TCP_ADDR", "127.0.0.1:14319"),
+        ]);
+        let cfg_legacy = IngestConfig::from_env_with(|k| legacy.get(k).map(|v| (*v).to_string()));
+        assert_eq!(cfg_legacy.otlp_http_addr, "127.0.0.1:14318");
+        assert_eq!(cfg_legacy.muob_tcp_addr, "127.0.0.1:14319");
+
+        let both: HashMap<&str, &str> = HashMap::from([
+            ("MU_OBSERVABLE_COLLECTOR_OTLP_HTTP_ADDR", "0.0.0.0:24318"),
+            ("MUOBSERVE_OTLP_HTTP_ADDR", "127.0.0.1:14318"),
+            ("MU_OBSERVABLE_COLLECTOR_MUOB_TCP_ADDR", "0.0.0.0:24319"),
+            ("MUOBSERVE_MUOB_TCP_ADDR", "127.0.0.1:14319"),
+        ]);
+        let cfg_canon = IngestConfig::from_env_with(|k| both.get(k).map(|v| (*v).to_string()));
+        assert_eq!(cfg_canon.otlp_http_addr, "0.0.0.0:24318");
+        assert_eq!(cfg_canon.muob_tcp_addr, "0.0.0.0:24319");
     }
 }

@@ -1,0 +1,31 @@
+[Unit]
+Description=MuObservable Edge Telemetry Collector Daemon
+Documentation=https://github.com/LMA1980/mu-observable-collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mu-observable-collector
+Group=mu-observable-collector
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/var/lib/mu-observable-collector
+EnvironmentFile=/etc/mu-observable-collector/collector.env
+ExecStart=/usr/local/bin/mu-observable-collector
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/mu-observable-collector
+ReadOnlyPaths=/etc/mu-observable-collector /var/log/journal /sys/class/thermal /proc/pressure
+InaccessiblePaths=/etc/shadow /root /home
+
+[Install]
+WantedBy=multi-user.target

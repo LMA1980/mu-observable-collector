@@ -24,11 +24,17 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-/// Canonical state directory allowlisted for read-write access by `MuObserve-collector`.
-pub const DEFAULT_COLLECTOR_STATE_DIR: &str = "/var/lib/muobserve-collector";
+/// Canonical state directory allowlisted for read-write access by `mu-observable-collector`.
+pub const DEFAULT_COLLECTOR_STATE_DIR: &str = "/var/lib/mu-observable-collector";
 
-/// Canonical configuration directory allowlisted for read-only access by `MuObserve-collector`.
-pub const DEFAULT_COLLECTOR_CONFIG_DIR: &str = "/etc/muobserve-collector";
+/// Legacy state directory retained as an on-disk fallback during migration.
+pub const LEGACY_COLLECTOR_STATE_DIR: &str = "/var/lib/muobserve-collector";
+
+/// Canonical configuration directory allowlisted for read-only access by `mu-observable-collector`.
+pub const DEFAULT_COLLECTOR_CONFIG_DIR: &str = "/etc/mu-observable-collector";
+
+/// Legacy configuration directory retained as an on-disk fallback during migration.
+pub const LEGACY_COLLECTOR_CONFIG_DIR: &str = "/etc/muobserve-collector";
 
 /// Startup confinement configuration for `MuObserve-collector` backed by `MuIsolation` [`KernelSandbox`].
 #[derive(Debug, Clone)]
@@ -66,8 +72,8 @@ impl Default for CollectorSandboxConfig {
     }
 }
 
-/// Builds the [`EffectiveSandboxPolicy`] for `MuObserve-collector` allowlisting
-/// `/var/lib/muobserve-collector` (read/write) and `/etc/muobserve-collector` (read-only)
+/// Builds the [`EffectiveSandboxPolicy`] for `mu-observable-collector` allowlisting
+/// `/var/lib/mu-observable-collector` (read/write) and `/etc/mu-observable-collector` (read-only)
 /// along with bounded cgroupv2 and `RLIMIT_MEMLOCK` ceilings.
 #[must_use]
 pub fn build_collector_sandbox_policy(cfg: &CollectorSandboxConfig) -> EffectiveSandboxPolicy {
@@ -94,7 +100,7 @@ pub fn build_collector_sandbox_policy(cfg: &CollectorSandboxConfig) -> Effective
 }
 
 /// Validates and lowers the `MuIsolation` [`KernelSandbox`] startup confinement plan
-/// (Landlock V3+ ruleset allowlisting `/var/lib/muobserve-collector` and `/etc/muobserve-collector`
+/// (Landlock V3+ ruleset allowlisting `/var/lib/mu-observable-collector` and `/etc/mu-observable-collector`
 /// + cgroupv2 resource ceilings + seccomp-BPF plan).
 pub fn apply_collector_startup_sandbox(
     cfg: &CollectorSandboxConfig,
@@ -133,9 +139,9 @@ impl Default for MtlsForwarderConfig {
         Self {
             upstream_addr: "127.0.0.1:9443".to_string(),
             server_name: "node-a".to_string(),
-            ca_cert_path: PathBuf::from("/etc/muobserve-collector/ca.crt"),
-            client_cert_path: PathBuf::from("/etc/muobserve-collector/client.crt"),
-            client_key_path: PathBuf::from("/etc/muobserve-collector/client.key"),
+            ca_cert_path: PathBuf::from("/etc/mu-observable-collector/tls/ca.crt"),
+            client_cert_path: PathBuf::from("/etc/mu-observable-collector/tls/client.crt"),
+            client_key_path: PathBuf::from("/etc/mu-observable-collector/tls/client.key"),
             initial_backoff_ms: 50,
             max_backoff_ms: 2_000,
             max_retries: 4,
@@ -466,15 +472,15 @@ mod tests {
         let etc_rule = plan
             .landlock_rules
             .iter()
-            .find(|r| r.path == Path::new("/etc/muobserve-collector"))
-            .expect("/etc/muobserve-collector Landlock rule");
+            .find(|r| r.path == Path::new("/etc/mu-observable-collector"))
+            .expect("/etc/mu-observable-collector Landlock rule");
         assert_eq!(etc_rule.access_mask, READ_ACCESS);
 
         let var_rule = plan
             .landlock_rules
             .iter()
-            .find(|r| r.path == Path::new("/var/lib/muobserve-collector"))
-            .expect("/var/lib/muobserve-collector Landlock rule");
+            .find(|r| r.path == Path::new("/var/lib/mu-observable-collector"))
+            .expect("/var/lib/mu-observable-collector Landlock rule");
         assert_eq!(var_rule.access_mask, READ_ACCESS | WRITE_ACCESS);
 
         let bin_rule = plan
@@ -483,6 +489,41 @@ mod tests {
             .find(|r| r.path == Path::new("/usr/local/bin"))
             .expect("/usr/local/bin Landlock rule");
         assert_eq!(bin_rule.access_mask, EXEC_ACCESS);
+
+        let default_fwd = MtlsForwarderConfig::default();
+        assert_eq!(
+            default_fwd.ca_cert_path,
+            Path::new("/etc/mu-observable-collector/tls/ca.crt")
+        );
+        assert_eq!(
+            default_fwd.client_cert_path,
+            Path::new("/etc/mu-observable-collector/tls/client.crt")
+        );
+        assert_eq!(
+            default_fwd.client_key_path,
+            Path::new("/etc/mu-observable-collector/tls/client.key")
+        );
+    }
+
+    #[test]
+    fn test_resolve_preferred_path_fallback_and_canonical_priority() {
+        let dir = tempdir().expect("tempdir");
+        let canonical = dir.path().join("mu-observable-collector");
+        let legacy = dir.path().join("muobserve-collector");
+
+        assert_eq!(
+            crate::resolve_preferred_path(&canonical, &legacy),
+            canonical
+        );
+
+        fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(crate::resolve_preferred_path(&canonical, &legacy), legacy);
+
+        fs::create_dir_all(&canonical).unwrap();
+        assert_eq!(
+            crate::resolve_preferred_path(&canonical, &legacy),
+            canonical
+        );
     }
 
     #[cfg(not(miri))]
